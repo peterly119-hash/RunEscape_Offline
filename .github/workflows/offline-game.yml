@@ -344,7 +344,8 @@ jobs:
                   const hash = createHash("sha256");
                   for (const full of (await walk(dist)).sort()) {
                       const rel = path.relative(dist, full).split(path.sep).join("/");
-                      if (SKIP.has(rel) || rel.endsWith(".map")) {
+                      // Hidden files (.htaccess) aren't served by GitHub Pages
+                      if (SKIP.has(rel) || rel.endsWith(".map") || rel.split("/").some((part) => part.startsWith("."))) {
                           continue;
                       }
                       const data = await readFile(full);
