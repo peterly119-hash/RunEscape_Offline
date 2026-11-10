@@ -1,0 +1,389 @@
+# Builds Run Escape (https://github.com/Dynrothe/Run-Escape) with offline support
+# and publishes it to this repository's GitHub Pages site. Open the site on an
+# iPhone, Add to Home Screen, open it once online, and it plays offline after.
+#
+# Setup: Settings > Pages > Source: GitHub Actions. Then Actions > Offline game >
+# Run workflow. It also rebuilds every Monday to pick up the game's updates.
+name: Offline game
+
+on:
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Branch or tag of Dynrothe/Run-Escape to build
+                required: true
+                default: main
+    schedule:
+        - cron: "17 3 * * 1"
+
+permissions:
+    contents: read
+    pages: write
+    id-token: write
+
+concurrency:
+    group: pages
+    cancel-in-progress: false
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  repository: Dynrothe/Run-Escape
+                  ref: ${{ inputs.ref || 'main' }}
+                  path: game
+                  persist-credentials: false
+
+            - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: 22
+
+            - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+              with:
+                  bun-version-file: game/package.json
+
+            - run: bun install --frozen-lockfile
+              working-directory: game
+
+            - name: Find the game's cache
+              id: game-cache
+              working-directory: game
+              run: |
+                  name=$(sed -n 's/.*GAME_CACHE_NAME = "\([^"]*\)".*/\1/p' src/game/cache.ts)
+                  test -n "$name"
+                  echo "name=$name" >> "$GITHUB_OUTPUT"
+
+            - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: game/caches
+                  key: osrs-cache-${{ steps.game-cache.outputs.name }}
+
+            - name: Download the game's cache
+              working-directory: game
+              env:
+                  CACHE_NAME: ${{ steps.game-cache.outputs.name }}
+              run: |
+                  if [ ! -f "caches/$CACHE_NAME/main_file_cache.dat2" ]; then
+                      bun run download-caches
+                  fi
+                  test -f "caches/$CACHE_NAME/main_file_cache.dat2"
+
+            - name: Build the game (single player)
+              working-directory: game
+              run: |
+                  bun run build
+                  bun run slim-cache
+                  find dist -name '*.map' -delete
+
+            - name: Add offline support
+              run: |
+                  mkdir -p offline-kit
+                  cat > offline-kit/sw.js <<'OFFLINE_KIT_EOF'
+                  // Run Escape offline service worker.
+                  //
+                  // 1. Saves the whole game (code, fonts, music and the slim OSRS cache) on the
+                  //    device when it's installed, so the game starts with no connection.
+                  // 2. Adds the Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy headers
+                  //    the game needs (it shares its cache with workers in a SharedArrayBuffer),
+                  //    so it runs from a static host such as GitHub Pages that can't set headers.
+                  //
+                  // __PRECACHE_VERSION__ is replaced by write-precache.mjs with a hash of every
+                  // file, so each new build installs a fresh copy (files that didn't change are
+                  // copied from the old one rather than downloaded again).
+
+                  const VERSION = "__PRECACHE_VERSION__";
+                  const PREFIX = "run-escape-offline-";
+                  const CACHE = PREFIX + VERSION;
+                  const BASE = new URL("./", self.location).href;
+                  const INDEX = BASE + "index.html";
+
+                  async function tell(message) {
+                      const clients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+                      for (const client of clients) {
+                          client.postMessage({ source: "run-escape-offline", ...message });
+                      }
+                  }
+
+                  async function fetchOk(url) {
+                      let lastError;
+                      for (let attempt = 0; attempt < 3; attempt++) {
+                          try {
+                              const response = await fetch(url, { cache: "reload" });
+                              if (response.ok) {
+                                  return response;
+                              }
+                              lastError = new Error(`${url}: ${response.status}`);
+                          } catch (e) {
+                              lastError = e;
+                          }
+                      }
+                      throw lastError;
+                  }
+
+                  self.addEventListener("install", (event) => {
+                      event.waitUntil(
+                          (async () => {
+                              const list = await (await fetchOk(BASE + "precache.json")).json();
+                              const cache = await caches.open(CACHE);
+                              const files = list.files;
+                              const total = files.reduce((sum, f) => sum + f.size, 0);
+                              let done = 0;
+                              let next = 0;
+                              const worker = async () => {
+                                  while (next < files.length) {
+                                      const file = files[next++];
+                                      const url = BASE + file.path;
+                                      // Hashed files (assets/, caches/chunks/) are the same file under
+                                      // the same name, so an older copy can be reused
+                                      let response = file.immutable ? await caches.match(url) : undefined;
+                                      if (!response) {
+                                          response = await fetchOk(url);
+                                      }
+                                      await cache.put(url, response);
+                                      done += file.size;
+                                      tell({ type: "progress", done, total });
+                                  }
+                              };
+                              await Promise.all(Array.from({ length: 6 }, worker));
+                              tell({ type: "installed" });
+                              // The first install takes over straight away (the page needs it for
+                              // its headers). An update waits until the game's closed, so a running
+                              // game never loses files it hasn't loaded yet.
+                              if (!self.registration.active) {
+                                  await self.skipWaiting();
+                              }
+                          })().catch((e) => {
+                              tell({ type: "failed", message: String(e && e.message ? e.message : e) });
+                              throw e;
+                          }),
+                      );
+                  });
+
+                  self.addEventListener("activate", (event) => {
+                      event.waitUntil(
+                          (async () => {
+                              for (const name of await caches.keys()) {
+                                  if (name.startsWith(PREFIX) && name !== CACHE) {
+                                      await caches.delete(name);
+                                  }
+                              }
+                              await self.clients.claim();
+                          })(),
+                      );
+                  });
+
+                  self.addEventListener("message", (event) => {
+                      if (event.data === "skip-waiting") {
+                          self.skipWaiting();
+                      }
+                  });
+
+                  // The headers that make the page cross-origin isolated
+                  function isolate(response) {
+                      if (!response || response.status === 0) {
+                          return response;
+                      }
+                      const headers = new Headers(response.headers);
+                      headers.set("Cross-Origin-Opener-Policy", "same-origin");
+                      headers.set("Cross-Origin-Embedder-Policy", "require-corp");
+                      headers.set("Cross-Origin-Resource-Policy", "cross-origin");
+                      return new Response(response.body, {
+                          status: response.status,
+                          statusText: response.statusText,
+                          headers,
+                      });
+                  }
+
+                  async function fromCache(request, url) {
+                      const cache = await caches.open(CACHE);
+                      if (request.mode === "navigate" || url.href === BASE) {
+                          return cache.match(INDEX);
+                      }
+                      // caches.json is asked for with ?build=<id>
+                      return (await cache.match(url.href)) ?? (await cache.match(url.href, { ignoreSearch: true }));
+                  }
+
+                  self.addEventListener("fetch", (event) => {
+                      const request = event.request;
+                      const url = new URL(request.url);
+                      if (request.method !== "GET" || url.origin !== self.location.origin || !url.href.startsWith(BASE)) {
+                          return;
+                      }
+                      if (request.cache === "only-if-cached" && request.mode !== "same-origin") {
+                          return;
+                      }
+                      // sw.js and the list are always checked with the server, for updates
+                      if (url.pathname.endsWith("/sw.js") || url.pathname.endsWith("/precache.json")) {
+                          return;
+                      }
+                      event.respondWith(
+                          (async () => {
+                              // Cache first: the saved copy is one whole build, so it always fits together.
+                              // New builds arrive as a new service worker.
+                              const cached = await fromCache(request, url);
+                              if (cached) {
+                                  return isolate(cached);
+                              }
+                              try {
+                                  return isolate(await fetch(request));
+                              } catch (e) {
+                                  if (request.mode === "navigate") {
+                                      return new Response("Run Escape isn't saved on this device yet. Open it once online.", {
+                                          status: 503,
+                                          headers: { "Content-Type": "text/plain; charset=utf-8" },
+                                      });
+                                  }
+                                  throw e;
+                              }
+                          })(),
+                      );
+                  });
+                  OFFLINE_KIT_EOF
+                  cat > offline-kit/register.html <<'OFFLINE_KIT_EOF'
+                      <script>
+                        // Run Escape offline: installs sw.js, which saves the game on this device
+                        // and gives the page the headers it needs. The first visit waits for the
+                        // download, then reloads once so the service worker serves the page.
+                        (function () {
+                          if (!("serviceWorker" in navigator) || (location.protocol !== "https:" && location.hostname !== "localhost")) return;
+                          var KEY = "run-escape-offline-reload";
+                          var overlay;
+                          function show(text) {
+                            if (!overlay) {
+                              overlay = document.createElement("div");
+                              overlay.style.cssText =
+                                "position:fixed;inset:0;z-index:2147483647;background:#000;color:#ff981f;" +
+                                "display:flex;align-items:center;justify-content:center;text-align:center;" +
+                                "font:16px/1.5 sans-serif;padding:24px";
+                              (document.body || document.documentElement).appendChild(overlay);
+                            }
+                            overlay.textContent = text;
+                          }
+                          function reloadOnce() {
+                            if (sessionStorage.getItem(KEY)) {
+                              // Reloaded already and still not isolated: let the game say why
+                              if (overlay) overlay.remove();
+                              return;
+                            }
+                            sessionStorage.setItem(KEY, "1");
+                            location.reload();
+                          }
+                          if (window.crossOriginIsolated) {
+                            sessionStorage.removeItem(KEY);
+                          } else {
+                            document.addEventListener("DOMContentLoaded", function () {
+                              show("Saving Run Escape on this device for offline play...");
+                            });
+                          }
+                          navigator.serviceWorker.addEventListener("message", function (event) {
+                            var data = event.data || {};
+                            if (data.source !== "run-escape-offline" || window.crossOriginIsolated) return;
+                            if (data.type === "progress") {
+                              show(
+                                "Saving Run Escape on this device for offline play... " +
+                                  Math.floor((100 * data.done) / data.total) + "%"
+                              );
+                            } else if (data.type === "failed") {
+                              sessionStorage.removeItem(KEY);
+                              show("Couldn't save the game (" + data.message + "). Check your connection and reopen it.");
+                            }
+                          });
+                          navigator.serviceWorker.addEventListener("controllerchange", function () {
+                            if (!window.crossOriginIsolated) reloadOnce();
+                          });
+                          navigator.serviceWorker.register("./sw.js").then(function () {
+                            if (!window.crossOriginIsolated && navigator.serviceWorker.controller) reloadOnce();
+                          });
+                        })();
+                      </script>
+                  OFFLINE_KIT_EOF
+                  cat > offline-kit/apply.mjs <<'OFFLINE_KIT_EOF'
+                  // Adds offline support to a finished Run Escape build (after bun run build and
+                  // bun run slim-cache): copies sw.js in, puts the registration script in
+                  // index.html, and lists every file in precache.json for the service worker.
+                  //
+                  //   node apply.mjs <dist> <kit dir>
+                  import { createHash } from "node:crypto";
+                  import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+                  import path from "node:path";
+
+                  const [dist, kit] = process.argv.slice(2).map((p) => path.resolve(p));
+                  if (!dist || !kit) {
+                      console.error("usage: node apply.mjs <dist> <kit dir>");
+                      process.exit(1);
+                  }
+
+                  const SKIP = new Set(["sw.js", "precache.json", "robots.txt"]);
+
+                  async function walk(dir) {
+                      const out = [];
+                      for (const entry of await readdir(dir, { withFileTypes: true })) {
+                          const full = path.join(dir, entry.name);
+                          if (entry.isDirectory()) {
+                              out.push(...(await walk(full)));
+                          } else {
+                              out.push(full);
+                          }
+                      }
+                      return out;
+                  }
+
+                  // The registration script goes first in <head>, before the game's module
+                  const indexPath = path.join(dist, "index.html");
+                  let index = await readFile(indexPath, "utf8");
+                  if (!index.includes("run-escape-offline")) {
+                      const register = await readFile(path.join(kit, "register.html"), "utf8");
+                      index = index.replace(/<head>/i, (m) => m + "\n" + register);
+                      await writeFile(indexPath, index);
+                  }
+
+                  const files = [];
+                  const hash = createHash("sha256");
+                  for (const full of (await walk(dist)).sort()) {
+                      const rel = path.relative(dist, full).split(path.sep).join("/");
+                      if (SKIP.has(rel) || rel.endsWith(".map")) {
+                          continue;
+                      }
+                      const data = await readFile(full);
+                      hash.update(rel).update("\0").update(createHash("sha256").update(data).digest());
+                      files.push({
+                          path: rel,
+                          size: (await stat(full)).size,
+                          // Named after their contents, so the same name is always the same file
+                          immutable: rel.startsWith("assets/") || rel.startsWith("caches/chunks/"),
+                      });
+                  }
+                  const version = hash.digest("hex").slice(0, 16);
+
+                  if (!files.some((f) => f.path === "caches/caches.json")) {
+                      console.error("No caches/caches.json in the build: run bun run slim-cache first");
+                      process.exit(1);
+                  }
+
+                  await writeFile(path.join(dist, "precache.json"), JSON.stringify({ version, files }));
+                  const sw = await readFile(path.join(kit, "sw.js"), "utf8");
+                  await writeFile(path.join(dist, "sw.js"), sw.replace('"__PRECACHE_VERSION__"', JSON.stringify(version)));
+
+                  const total = files.reduce((sum, f) => sum + f.size, 0);
+                  console.log(`Offline: ${files.length} files, ${(total / 1e6).toFixed(1)} MB, version ${version}`);
+                  OFFLINE_KIT_EOF
+                  node offline-kit/apply.mjs game/dist offline-kit
+
+            - uses: actions/configure-pages@v5
+
+            - uses: actions/upload-pages-artifact@v4
+              with:
+                  path: game/dist
+
+    deploy:
+        needs: build
+        runs-on: ubuntu-latest
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        steps:
+            - id: deployment
+              uses: actions/deploy-pages@v4
